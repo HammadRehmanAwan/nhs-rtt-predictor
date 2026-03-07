@@ -74,10 +74,64 @@ st.markdown("""
 
 @st.cache_data(show_spinner="Loading NHS RTT dataset...")
 def load_data():
-    df = pd.read_csv(
-        "nhs_rtt_waiting_times_2021_2025.csv",
-        low_memory=False
-    )
+    import os, json
+
+    LOCAL_PATH = "nhs_rtt_waiting_times_2021_2025.csv"
+    TMP_PATH   = "/tmp/nhs_rtt_waiting_times_2021_2025.csv"
+
+    if os.path.exists(LOCAL_PATH):
+        # ── Running locally ───────────────────────────────────────
+        df = pd.read_csv(LOCAL_PATH, low_memory=False)
+
+    elif os.path.exists(TMP_PATH):
+        # ── Already downloaded in this session ────────────────────
+        df = pd.read_csv(TMP_PATH, low_memory=False)
+
+    else:
+        # ── Running on Streamlit Cloud — download from Kaggle ─────
+        try:
+            # Write kaggle.json from Streamlit secrets
+            kaggle_dir = os.path.expanduser("~/.kaggle")
+            os.makedirs(kaggle_dir, exist_ok=True)
+            kaggle_creds = {
+                "username": st.secrets["kaggle"]["username"],
+                "key":      st.secrets["kaggle"]["key"],
+            }
+            with open(f"{kaggle_dir}/kaggle.json", "w") as f:
+                json.dump(kaggle_creds, f)
+            os.chmod(f"{kaggle_dir}/kaggle.json", 0o600)
+
+            # Download dataset
+            import subprocess
+            st.info("⏳ Downloading NHS dataset from Kaggle (first run only, ~30 seconds)...")
+            subprocess.run([
+                "kaggle", "datasets", "download",
+                "-d", "hammad9191/nhs-consultant-led-rtt-waiting-times20212025",
+                "--unzip", "-p", "/tmp"
+            ], check=True, capture_output=True)
+
+            # Find the CSV in /tmp
+            csv_candidates = [f for f in os.listdir("/tmp") if f.endswith(".csv")]
+            if not csv_candidates:
+                st.error("Download succeeded but no CSV found in /tmp.")
+                st.stop()
+
+            downloaded = f"/tmp/{csv_candidates[0]}"
+            df = pd.read_csv(downloaded, low_memory=False)
+
+        except Exception as e:
+            st.error(f"""
+            ❌ Could not load dataset: {e}
+
+            Make sure your Streamlit secrets are set correctly:
+            ```
+            [kaggle]
+            username = "hammad9191"
+            key = "your-kaggle-api-key"
+            ```
+            Go to: app settings → Secrets → paste the above.
+            """)
+            st.stop()
     df["period_dt"] = pd.to_datetime(df["period"], format="%Y-%m", errors="coerce")
     df = df.dropna(subset=["period_dt"])
     return df
