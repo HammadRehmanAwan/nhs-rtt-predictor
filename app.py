@@ -74,77 +74,10 @@ st.markdown("""
 
 @st.cache_data(show_spinner="Loading NHS RTT dataset...")
 def load_data():
-    import os, json, glob
-
-    LOCAL_PATH = "nhs_rtt_waiting_times_2021_2025.csv"
-    TMP_CSV    = "/tmp/nhs_rtt_waiting_times_2021_2025.csv"
-
-    def setup_kaggle_credentials():
-        kaggle_dir = os.path.expanduser("~/.kaggle")
-        os.makedirs(kaggle_dir, exist_ok=True)
-        creds = {
-            "username": st.secrets["kaggle"]["username"],
-            "key":      st.secrets["kaggle"]["key"],
-        }
-        cred_path = f"{kaggle_dir}/kaggle.json"
-        with open(cred_path, "w") as f:
-            json.dump(creds, f)
-        os.chmod(cred_path, 0o600)
-
-    def download_from_kaggle():
-        import subprocess
-        setup_kaggle_credentials()
-        result = subprocess.run([
-            "python", "-m", "kaggle",
-            "datasets", "download",
-            "-d", "hammad9191/nhs-consultant-led-rtt-waiting-times20212025",
-            "--unzip", "-p", "/tmp"
-        ], capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr)
-
-    # ── Decide where to load from ─────────────────────────────
-    if os.path.exists(LOCAL_PATH):
-        df = pd.read_csv(LOCAL_PATH, low_memory=False)
-
-    elif os.path.exists(TMP_CSV):
-        df = pd.read_csv(TMP_CSV, low_memory=False)
-
-    else:
-        # Need to download
-        progress = st.empty()
-        progress.info("⏳ Downloading NHS dataset from Kaggle (one-time setup, ~30 seconds)...")
-        try:
-            download_from_kaggle()
-
-            # Find any CSV in /tmp
-            found = glob.glob("/tmp/*.csv")
-            if not found:
-                st.error("❌ Download finished but no CSV file was found in /tmp. Check your Kaggle secrets.")
-                st.stop()
-
-            # Use whichever CSV was downloaded
-            df = pd.read_csv(found[0], low_memory=False)
-
-            # Cache it to TMP_CSV for next reload
-            df.to_csv(TMP_CSV, index=False)
-            progress.success("✅ Dataset loaded successfully!")
-
-        except Exception as e:
-            progress.empty()
-            st.error(f"""
-❌ Could not download dataset.
-
-**Error:** `{e}`
-
-**Check your Streamlit secrets** (⋮ → Settings → Secrets):
-```toml
-[kaggle]
-username = "hammad9191"
-key = "your-kaggle-api-key"
-```
-            """)
-            st.stop()
+    df = pd.read_csv(
+        "nhs_rtt_waiting_times_2021_2025.csv",
+        low_memory=False
+    )
     df["period_dt"] = pd.to_datetime(df["period"], format="%Y-%m", errors="coerce")
     df = df.dropna(subset=["period_dt"])
     return df
