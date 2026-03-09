@@ -1,5 +1,6 @@
-streamlit==1.40.0
-pandas==2.2.3
-plotly==5.18.0
-numpy==1.26.4
-statsmodels==0.14.2
+streamlit
+pandas
+prophet
+plotly
+numpy
+kaggle
