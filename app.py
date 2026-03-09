@@ -17,7 +17,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from prophet import Prophet
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -74,10 +74,57 @@ st.markdown("""
 
 @st.cache_data(show_spinner="Loading NHS RTT dataset...")
 def load_data():
-    df = pd.read_csv(
-        "nhs_rtt_waiting_times_2021_2025.csv",
-        low_memory=False
-    )
+    import os, json, glob
+
+    LOCAL_PATH = "nhs_rtt_waiting_times_2021_2025.csv"
+    TMP_CSV    = "/tmp/nhs_rtt_waiting_times_2021_2025.csv"
+
+    def setup_kaggle_credentials():
+        kaggle_dir = os.path.expanduser("~/.kaggle")
+        os.makedirs(kaggle_dir, exist_ok=True)
+        creds = {
+            "username": st.secrets["kaggle"]["username"],
+            "key":      st.secrets["kaggle"]["key"],
+        }
+        cred_path = f"{kaggle_dir}/kaggle.json"
+        with open(cred_path, "w") as f:
+            json.dump(creds, f)
+        os.chmod(cred_path, 0o600)
+
+    def download_from_kaggle():
+        import subprocess
+        setup_kaggle_credentials()
+        result = subprocess.run([
+            "python", "-m", "kaggle",
+            "datasets", "download",
+            "-d", "hammad9191/nhs-consultant-led-rtt-waiting-times20212025",
+            "--unzip", "-p", "/tmp"
+        ], capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr)
+
+    if os.path.exists(LOCAL_PATH):
+        df = pd.read_csv(LOCAL_PATH, low_memory=False)
+
+    elif os.path.exists(TMP_CSV):
+        # Already downloaded in this session — load silently
+        df = pd.read_csv(TMP_CSV, low_memory=False)
+
+    else:
+        # First cold start — download once, then cache to /tmp
+        msg = st.info("⏳ Setting up NHS dataset for the first time (~30 seconds)...")
+        try:
+            download_from_kaggle()
+            found = glob.glob("/tmp/*.csv")
+            if not found:
+                st.error("❌ Download succeeded but no CSV found.")
+                st.stop()
+            df = pd.read_csv(found[0], low_memory=False)
+            df.to_csv(TMP_CSV, index=False)  # cache for future reloads
+            msg.empty()                       # remove the info message immediately
+        except Exception as e:
+            st.error(f"❌ Could not load dataset: {e}\n\nCheck Secrets: kaggle.username and kaggle.key")
+            st.stop()
     df["period_dt"] = pd.to_datetime(df["period"], format="%Y-%m", errors="coerce")
     df = df.dropna(subset=["period_dt"])
     return df
