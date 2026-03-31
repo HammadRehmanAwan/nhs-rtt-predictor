@@ -1,6 +1,7 @@
-streamlit
-pandas
-prophet
-plotly
-numpy
-kaggle
+streamlit>=1.32
+pandas>=2.0
+numpy>=1.24
+plotly>=5.18
+prophet>=1.1
+kaggle>=1.6
+pytest>=8.0
