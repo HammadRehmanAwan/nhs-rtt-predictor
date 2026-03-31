@@ -23,11 +23,19 @@ from src.config import (
     DISCLAIMER_TEXT,
     ESTIMATE_SOURCE_SPECIALTY,
     FORECAST_MIN_HISTORY_POINTS,
+    FULL_HISTORY_TARGET_MONTHS,
     GLOBAL_STYLES,
     NATIONAL_TARGETS,
     NHS_COLORS,
+    PATIENT_PROXY_EXPLANATION,
 )
-from src.data_loader import DataLoadError, DataValidationError, DataLoadResult, load_rtt_data
+from src.data_loader import (
+    DataLoadError,
+    DataValidationError,
+    DataLoadResult,
+    load_rtt_data,
+    prefer_fuller_dataset,
+)
 from src.forecasting import ForecastResult, forecast_waiting_list
 from src.patient_logic import (
     apply_urgency_adjustment,
@@ -76,14 +84,33 @@ def load_dashboard_data(
     kaggle_username: str | None,
     kaggle_key: str | None,
 ) -> DataLoadResult:
-    credentials = None
-    if kaggle_username and kaggle_key:
-        credentials = {"username": kaggle_username, "key": kaggle_key}
+    local_result: DataLoadResult | None = None
+    kaggle_result: DataLoadResult | None = None
 
-    return load_rtt_data(
-        allow_kaggle_download=bool(credentials),
-        kaggle_credentials=credentials,
-    )
+    try:
+        local_result = load_rtt_data(
+            allow_kaggle_download=False,
+            kaggle_credentials=None,
+        )
+    except DataLoadError:
+        local_result = None
+
+    if kaggle_username and kaggle_key:
+        try:
+            kaggle_result = load_rtt_data(
+                dataset_paths=(),
+                allow_kaggle_download=True,
+                kaggle_credentials={"username": kaggle_username, "key": kaggle_key},
+            )
+        except DataLoadError:
+            kaggle_result = None
+
+    preferred = prefer_fuller_dataset(local_result, kaggle_result)
+    if preferred is None:
+        raise DataLoadError(
+            "No RTT dataset could be loaded from the local CSV or optional Kaggle fallback."
+        )
+    return preferred
 
 
 @st.cache_data(show_spinner="Preparing dashboard views...")
@@ -160,7 +187,7 @@ def render_forecast_caption(forecast_result: ForecastResult) -> None:
         caption_parts.append(f"Holdout MAPE: {forecast_result.mape:.1f}%")
     st.caption(" | ".join(caption_parts))
     if forecast_result.warning:
-        st.info(forecast_result.warning)
+        st.caption(forecast_result.warning)
 
 
 def render_recommendation_box(sections: dict[str, list[str]]) -> None:
@@ -216,12 +243,6 @@ all_specialties = sorted(specialty_data[Columns.TREATMENT_FUNCTION_NAME].dropna(
 
 render_header(period_range=period_range, source_label=data_result.source_label)
 st.caption(f"Loaded from `{data_result.source_path}`")
-
-if len(national) < FORECAST_MIN_HISTORY_POINTS:
-    st.warning(
-        f"Only {len(national)} monthly snapshots are currently loaded. "
-        "Forecasts remain available, but they will use safer baseline logic until longer history is present."
-    )
 
 forecast_12_month = national_future["yhat"].iloc[-1] if not national_future.empty else None
 
@@ -438,7 +459,7 @@ with tab2:
     ].copy()
 
     if specialty_trust_table.empty:
-        st.warning(
+        st.caption(
             "No latest-month trust + specialty rows were available for this specialty. "
             "Showing trust-wide latest-month performance instead."
         )
@@ -463,8 +484,7 @@ with tab2:
         )
     else:
         st.caption(
-            "Wait Proxy (wks) is a heuristic derived from latest trust + specialty RTT performance, "
-            "not a patient-level predicted waiting time."
+            "Wait estimate is based on the latest trust + specialty RTT performance data."
         )
         display_trusts = specialty_trust_table[
             [
@@ -494,8 +514,7 @@ with tab2:
 with tab3:
     st.markdown("### 👤 Patient Wait Time Predictor")
     st.caption(
-        "Use the latest RTT data to build a cautious proxy estimate and compare specialty-aware alternatives. "
-        "This is planning support, not a patient-level prediction."
+        "Use the latest RTT data to estimate likely wait pressures and compare alternative trusts in your region."
     )
 
     symptoms = st.text_area(
@@ -597,7 +616,7 @@ with tab3:
             )
 
             if current_estimate.estimate_source != ESTIMATE_SOURCE_SPECIALTY:
-                st.warning(
+                st.caption(
                     f"No latest trust + specialty row was available for {selected_trust} / "
                     f"{selected_patient_specialty}. The current estimate uses trust-wide performance instead."
                 )
@@ -608,12 +627,12 @@ with tab3:
             fallback_count = int(len(alternatives) - specialty_based_count)
             if len(alternatives) > 0:
                 if specialty_based_count == 0:
-                    st.info(
+                    st.caption(
                         "Regional alternatives use trust-wide fallback estimates because "
                         "no latest trust + specialty rows were available in this region."
                     )
                 elif fallback_count > 0:
-                    st.info(
+                    st.caption(
                         f"{specialty_based_count} regional alternatives use trust + specialty data and "
                         f"{fallback_count} use trust-wide fallback estimates where specialty rows were missing."
                     )
@@ -661,8 +680,7 @@ with tab3:
                     )
 
             st.caption(
-                "Wait proxy values are derived from RTT performance data and simple urgency multipliers. "
-                "They are not actual appointment dates or true median waits."
+                PATIENT_PROXY_EXPLANATION
             )
 
             recommendation_sections = build_recommendation_sections(
@@ -695,6 +713,11 @@ with tab3:
         )
 
 st.markdown("---")
+if data_result.period_count < FULL_HISTORY_TARGET_MONTHS:
+    st.caption(
+        f"Current loaded history covers {data_result.period_count} monthly releases. "
+        "If a fuller RTT file or Kaggle-backed refresh is available, the app will use it for stronger trends and forecasts."
+    )
 st.caption(
     f"Data: NHS England RTT Open Data · Source mode: {data_result.source_label} · {DISCLAIMER_TEXT}"
 )

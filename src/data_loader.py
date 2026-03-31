@@ -15,6 +15,7 @@ import pandas as pd
 from src.config import (
     Columns,
     DATASET_PATHS,
+    FULL_HISTORY_TARGET_MONTHS,
     KAGGLE_DATASET_SLUG,
     KAGGLE_JSON_FILENAME,
     NUMERIC_COLUMNS,
@@ -37,6 +38,17 @@ class DataLoadResult:
     dataframe: pd.DataFrame
     source_path: str
     source_label: str
+    period_count: int
+
+
+def _count_distinct_periods(path: Path) -> int:
+    """Count distinct `period` values without loading the full dataset."""
+
+    try:
+        period_frame = pd.read_csv(path, usecols=[Columns.PERIOD], low_memory=False)
+    except Exception:
+        return 0
+    return int(period_frame[Columns.PERIOD].dropna().nunique())
 
 
 def validate_required_columns(dataframe: pd.DataFrame) -> None:
@@ -50,17 +62,21 @@ def validate_required_columns(dataframe: pd.DataFrame) -> None:
 
 
 def _candidate_paths(dataset_paths: Iterable[str] | None = None) -> list[Path]:
-    paths = dataset_paths or DATASET_PATHS
+    paths = DATASET_PATHS if dataset_paths is None else dataset_paths
     return [Path(path) for path in paths]
 
 
 def find_local_dataset(dataset_paths: Iterable[str] | None = None) -> Path | None:
-    """Return the first readable local dataset path."""
+    """Return the most complete readable local dataset path."""
 
+    ranked_paths: list[tuple[int, Path]] = []
     for path in _candidate_paths(dataset_paths):
         if path.exists() and path.is_file():
-            return path
-    return None
+            ranked_paths.append((_count_distinct_periods(path), path))
+    if not ranked_paths:
+        return None
+    ranked_paths.sort(key=lambda item: (item[0], item[1].stat().st_size), reverse=True)
+    return ranked_paths[0][1]
 
 
 def _normalise_dataframe(dataframe: pd.DataFrame) -> pd.DataFrame:
@@ -101,6 +117,7 @@ def load_local_dataset(path: Path) -> DataLoadResult:
         dataframe=_normalise_dataframe(dataframe),
         source_path=str(path),
         source_label="Local CSV",
+        period_count=_count_distinct_periods(path),
     )
 
 
@@ -179,6 +196,7 @@ def load_rtt_data(
             dataframe=result.dataframe,
             source_path=result.source_path,
             source_label="Kaggle download",
+            period_count=result.period_count,
         )
 
     searched_paths = ", ".join(str(path) for path in _candidate_paths(dataset_paths))
@@ -187,3 +205,22 @@ def load_rtt_data(
         f"Searched: {searched_paths}. "
         "Place the CSV in the project folder or configure optional Kaggle credentials."
     )
+
+
+def prefer_fuller_dataset(
+    local_result: DataLoadResult | None,
+    kaggle_result: DataLoadResult | None,
+    minimum_full_history_months: int = FULL_HISTORY_TARGET_MONTHS,
+) -> DataLoadResult | None:
+    """Choose the richer dataset when both local and Kaggle sources are available."""
+
+    if local_result is None:
+        return kaggle_result
+    if kaggle_result is None:
+        return local_result
+
+    if local_result.period_count >= minimum_full_history_months:
+        return local_result
+    if kaggle_result.period_count > local_result.period_count:
+        return kaggle_result
+    return local_result
