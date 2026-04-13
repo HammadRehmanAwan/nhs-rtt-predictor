@@ -105,6 +105,11 @@ DATASET_PATHS = (
 )
 KAGGLE_DATASET_SLUG = "hammad9191/nhs-consultant-led-rtt-waiting-times20212025"
 KAGGLE_JSON_FILENAME = "kaggle.json"
+GOOGLE_DRIVE_DATASET_URL = (
+    "https://drive.google.com/file/d/1qhxhC72HM208UZmzEcR7S_vWf1ywRsAQ/view?usp=drive_link"
+)
+GOOGLE_DRIVE_FILE_ID = "1qhxhC72HM208UZmzEcR7S_vWf1ywRsAQ"
+GOOGLE_DRIVE_DOWNLOAD_PATH = "/tmp/nhs_rtt_waiting_times_2021_2025_google_drive.csv"
 
 REQUIRED_COLUMNS = [
     Columns.PERIOD,

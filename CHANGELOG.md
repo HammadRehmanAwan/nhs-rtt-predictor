@@ -20,6 +20,7 @@
 - Prevented negative forecast outputs.
 - Added lightweight holdout MAE/MAPE reporting where practical.
 - Moved Kaggle download logic out of the UI flow and made it optional.
+- Added Google Drive full-history dataset support for deployments where the local CSV is incomplete.
 - Added clearer data validation and load-time error messages.
 
 ## Quality And Documentation
