@@ -37,7 +37,7 @@ APP_PAGE_CONFIG = {
 
 APP_TITLE = "NHS RTT Waiting List Predictor"
 APP_SUBTITLE_TEMPLATE = (
-    "NHS RTT analytics, forecasting, and patient wait guidance "
+    "NHS RTT analytics, forecasting, and cautious proxy wait estimates "
     "for {period_range}"
 )
 
@@ -149,7 +149,6 @@ FORECAST_PERIODS = 12
 FORECAST_MIN_HISTORY_POINTS = 12
 FORECAST_HOLDOUT_PERIODS = 3
 FORECAST_BASELINE_WINDOW = 3
-FULL_HISTORY_TARGET_MONTHS = 48
 
 RECENT_TREND_WINDOW = 4
 RECENT_TREND_THRESHOLD_PCT = 3.0
@@ -165,11 +164,6 @@ ESTIMATE_SOURCE_LABELS = {
 DISCLAIMER_TEXT = (
     "For informational purposes only. This dashboard does not provide medical advice "
     "and does not guarantee an individual waiting time."
-)
-
-PATIENT_PROXY_EXPLANATION = (
-    "Estimated wait is derived from RTT performance data and should be treated as a planning guide, "
-    "not a confirmed appointment time."
 )
 
 SPECIALTY_KEYWORDS = {
