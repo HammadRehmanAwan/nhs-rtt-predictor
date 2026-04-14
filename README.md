@@ -58,9 +58,7 @@ The app prefers a local CSV first. By default it looks for:
 - `nhs_rtt_waiting_times_2021_2025.csv` in the project root
 - `/tmp/nhs_rtt_waiting_times_2021_2025.csv`
 
-If the local CSV has incomplete history, the app can also use the configured Google Drive full-history file. The file must be shared as "Anyone with the link" for server deployments to download it. Kaggle remains available as an optional fallback when Streamlit secrets are configured.
-
-The date range shown in the dashboard is derived from the loaded file, not hard-coded. If the loaded CSV only contains a subset of months, the UI and forecast behavior will reflect that smaller range.
+The date range shown in the dashboard is derived from the loaded file, not hard-coded. If your local CSV only contains a subset of months, the UI and forecast behavior will reflect that smaller range.
 
 ## Setup
 
@@ -86,7 +84,7 @@ pytest -q
 
 ## Local-First Operation
 
-The recommended way to run the app locally is to place the full RTT CSV in the project folder and run Streamlit locally.
+The recommended way to run the app is to place the RTT CSV in the project folder and run Streamlit locally.
 
 Why this is preferred:
 
@@ -94,8 +92,6 @@ Why this is preferred:
 - Clearer reproducibility
 - Faster startup
 - No dependency on external credentials for normal use
-
-If the local file is incomplete, the app will try the configured Google Drive source and use whichever source has broader monthly coverage.
 
 ## Optional Kaggle Secrets
 
