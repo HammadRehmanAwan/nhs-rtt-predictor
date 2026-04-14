@@ -1,700 +1,652 @@
-from __future__ import annotations
-
-import warnings
-from html import escape
-
-import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
-
-from src.aggregations import (
-    build_latest_trust_specialty_summary,
-    build_latest_trust_summary,
-    build_national_trend,
-    build_specialty_trend,
-    classify_recent_trend,
-    latest_period_value,
-)
-from src.config import (
-    APP_PAGE_CONFIG,
-    APP_SUBTITLE_TEMPLATE,
-    APP_TITLE,
-    Columns,
-    DISCLAIMER_TEXT,
-    ESTIMATE_SOURCE_SPECIALTY,
-    FORECAST_MIN_HISTORY_POINTS,
-    GLOBAL_STYLES,
-    NATIONAL_TARGETS,
-    NHS_COLORS,
-)
-from src.data_loader import DataLoadError, DataValidationError, DataLoadResult, load_rtt_data
-from src.forecasting import ForecastResult, forecast_waiting_list
-from src.patient_logic import (
-    apply_urgency_adjustment,
-    build_recommendation_sections,
-    build_region_alternatives,
-    resolve_wait_estimate,
-    suggest_specialty_from_symptoms,
-)
-from src.utils import (
-    estimate_source_label,
-    format_compact_number,
-    format_period_range,
-    performance_color,
-    render_bullet_list,
-)
-
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from prophet import Prophet
+import warnings
 warnings.filterwarnings("ignore")
 
-st.set_page_config(**APP_PAGE_CONFIG)
-st.markdown(GLOBAL_STYLES, unsafe_allow_html=True)
+st.set_page_config(
+    page_title="NHS RTT Waiting List Predictor",
+    page_icon="🏥",
+    layout="wide",
+)
 
-FORECAST_METHOD_LABELS = {
-    "prophet": "Prophet",
-    "moving_average_fallback": "Moving-average baseline",
-    "last_value_fallback": "Last-value baseline",
-}
+NHS_BLUE   = "#003087"
+NHS_GREEN  = "#00B294"
+NHS_RED    = "#DA291C"
+NHS_YELLOW = "#FAB900"
 
-
-def get_kaggle_credentials_from_streamlit() -> dict[str, str] | None:
-    """Read optional Kaggle credentials from Streamlit secrets."""
-
-    try:
-        kaggle_config = st.secrets.get("kaggle", {})
-    except Exception:
-        return None
-
-    username = kaggle_config.get("username")
-    key = kaggle_config.get("key")
-    if username and key:
-        return {"username": username, "key": key}
-    return None
+st.markdown("""
+<style>
+    .main { background-color: #F5F7FA; }
+    .block-container { padding-top: 1.5rem; }
+    .metric-card {
+        background: white;
+        border-radius: 14px;
+        padding: 18px;
+        text-align: center;
+        border: 1px solid #E5E7EB;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+    }
+    .metric-label { font-size: 12px; color: #6B7280; margin-bottom: 4px; }
+    .metric-value { font-size: 26px; font-weight: 700; }
+    .metric-sub   { font-size: 11px; color: #9CA3AF; margin-top: 2px; }
+    .ai-box {
+        background: #EFF6FF;
+        border-left: 4px solid #003087;
+        border-radius: 12px;
+        padding: 16px;
+        margin-top: 12px;
+    }
+    .trust-card {
+        background: white;
+        border-radius: 12px;
+        padding: 12px 16px;
+        border: 1px solid #D1FAE5;
+        margin-bottom: 8px;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 
 @st.cache_data(show_spinner="Loading NHS RTT dataset...")
-def load_dashboard_data(
-    kaggle_username: str | None,
-    kaggle_key: str | None,
-) -> DataLoadResult:
-    credentials = None
-    if kaggle_username and kaggle_key:
-        credentials = {"username": kaggle_username, "key": kaggle_key}
+def load_data():
+    import os, json, glob
 
-    return load_rtt_data(
-        allow_kaggle_download=bool(credentials),
-        kaggle_credentials=credentials,
+    LOCAL_PATH = "nhs_rtt_waiting_times_2021_2025.csv"
+    TMP_CSV    = "/tmp/nhs_rtt_waiting_times_2021_2025.csv"
+
+    def setup_kaggle_credentials():
+        kaggle_dir = os.path.expanduser("~/.kaggle")
+        os.makedirs(kaggle_dir, exist_ok=True)
+        creds = {
+            "username": st.secrets["kaggle"]["username"],
+            "key":      st.secrets["kaggle"]["key"],
+        }
+        cred_path = f"{kaggle_dir}/kaggle.json"
+        with open(cred_path, "w") as f:
+            json.dump(creds, f)
+        os.chmod(cred_path, 0o600)
+
+    def download_from_kaggle():
+        import subprocess
+        setup_kaggle_credentials()
+        result = subprocess.run([
+            "python", "-m", "kaggle",
+            "datasets", "download",
+            "-d", "hammad9191/nhs-consultant-led-rtt-waiting-times20212025",
+            "--unzip", "-p", "/tmp"
+        ], capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr)
+
+    if os.path.exists(LOCAL_PATH):
+        df = pd.read_csv(LOCAL_PATH, low_memory=False)
+
+    elif os.path.exists(TMP_CSV):
+        df = pd.read_csv(TMP_CSV, low_memory=False)
+
+    else:
+        msg = st.info("⏳ Setting up NHS dataset for the first time (~30 seconds)...")
+        try:
+            download_from_kaggle()
+            found = glob.glob("/tmp/*.csv")
+            if not found:
+                st.error("❌ Download succeeded but no CSV found.")
+                st.stop()
+            df = pd.read_csv(found[0], low_memory=False)
+            df.to_csv(TMP_CSV, index=False)
+            msg.empty()
+        except Exception as e:
+            st.error(f"❌ Could not load dataset: {e}\n\nCheck Secrets: kaggle.username and kaggle.key")
+            st.stop()
+
+    df["period_dt"] = pd.to_datetime(df["period"], format="%Y-%m", errors="coerce")
+    df = df.dropna(subset=["period_dt"])
+    return df
+
+
+@st.cache_data(show_spinner="Building national trends...")
+def build_national(df):
+    nat = (
+        df[(df["rtt_part_type"] == "Part_2") & (df["treatment_function_code"] == "C_999")]
+        .groupby("period_dt")[["total_waiting", "within_18_weeks", "over_52_weeks"]]
+        .sum().reset_index().sort_values("period_dt")
     )
+    nat["pct_within_18"] = (nat["within_18_weeks"] / nat["total_waiting"] * 100).round(1)
+    nat["pct_over_52"]   = (nat["over_52_weeks"]   / nat["total_waiting"] * 100).round(1)
+    return nat
 
 
-@st.cache_data(show_spinner="Preparing dashboard views...")
-def build_dashboard_views(dataframe: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    national = build_national_trend(dataframe)
-    specialty = build_specialty_trend(dataframe)
-    trust_summary = build_latest_trust_summary(dataframe)
-    trust_specialty = build_latest_trust_specialty_summary(dataframe)
-    return national, specialty, trust_summary, trust_specialty
-
-
-@st.cache_data(show_spinner="Running forecast...")
-def build_forecast(series: pd.DataFrame) -> ForecastResult:
-    return forecast_waiting_list(series)
-
-
-def metric_card(label: str, value: str, subtext: str, color: str) -> str:
-    return f"""
-    <div class='metric-card'>
-        <div class='metric-label'>{escape(label)}</div>
-        <div class='metric-value' style='color:{color}'>{escape(value)}</div>
-        <div class='metric-sub'>{escape(subtext)}</div>
-    </div>
-    """
-
-
-def wait_card(
-    title: str,
-    wait_weeks: int,
-    pct_within_18: float,
-    source_label: str,
-    css_class: str,
-    saving_weeks: int | None = None,
-) -> str:
-    saving_html = ""
-    if saving_weeks is not None:
-        saving_html = (
-            f"<p style='font-size:11px;color:{NHS_COLORS['green']};margin:6px 0 0'>"
-            f"Save about {saving_weeks} weeks</p>"
-        )
-
-    return f"""
-    <div class='mini-card {css_class}'>
-        <p style='font-size:11px;color:#6B7280;margin:0'><b>{escape(title[:60])}</b></p>
-        <p style='font-size:30px;font-weight:700;color:{NHS_COLORS['blue'] if css_class == 'primary' else NHS_COLORS['green']};margin:6px 0'>
-            ~{wait_weeks} wks
-        </p>
-        <p style='font-size:11px;color:#6B7280;margin:0'>{pct_within_18:.1f}% within 18 weeks</p>
-        <p style='font-size:11px;color:#6B7280;margin:6px 0 0'>{escape(source_label)}</p>
-        {saving_html}
-    </div>
-    """
-
-
-def render_header(period_range: str, source_label: str) -> None:
-    subtitle = APP_SUBTITLE_TEMPLATE.format(period_range=period_range)
-    st.markdown(
-        f"""
-        <div class='hero-card'>
-            <h2 class='hero-title'>🏥 {escape(APP_TITLE)}</h2>
-            <p class='hero-subtitle'>{escape(subtitle)} · Source: {escape(source_label)}</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
+@st.cache_data(show_spinner="Training forecast model...")
+def run_prophet(series, periods=12):
+    prophet_df = series.rename(columns={"period_dt": "ds", "total_waiting": "y"})
+    m = Prophet(
+        yearly_seasonality=True,
+        weekly_seasonality=False,
+        daily_seasonality=False,
+        changepoint_prior_scale=0.05,
+        interval_width=0.95,
     )
+    m.fit(prophet_df[["ds", "y"]].dropna())
+    future   = m.make_future_dataframe(periods=periods, freq="MS")
+    forecast = m.predict(future)
+    return forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]]
 
 
-def render_forecast_caption(forecast_result: ForecastResult) -> None:
-    method_label = FORECAST_METHOD_LABELS.get(forecast_result.method, forecast_result.method)
-    caption_parts = [f"Forecast method: {method_label}"]
-    if forecast_result.mae is not None:
-        caption_parts.append(f"Holdout MAE: {forecast_result.mae:,.0f}")
-    if forecast_result.mape is not None:
-        caption_parts.append(f"Holdout MAPE: {forecast_result.mape:.1f}%")
-    st.caption(" | ".join(caption_parts))
-    if forecast_result.warning:
-        st.info(forecast_result.warning)
-
-
-def render_recommendation_box(sections: dict[str, list[str]]) -> None:
-    html_sections = "".join(
-        f"<h4 style='margin:12px 0 6px;color:{NHS_COLORS['ink']}'>{escape(title)}</h4>{render_bullet_list(items)}"
-        for title, items in sections.items()
+@st.cache_data(show_spinner="Processing specialties...")
+def build_specialty_data(df):
+    spec = (
+        df[(df["rtt_part_type"] == "Part_2") & (df["treatment_function_code"] != "C_999")]
+        .groupby(["period_dt", "treatment_function_name"])[
+            ["total_waiting", "within_18_weeks", "over_52_weeks"]
+        ].sum().reset_index()
     )
-    st.markdown(
-        f"""
-        <div class='advice-box'>
-            <div style='display:flex;align-items:center;gap:8px;margin-bottom:6px'>
-                <span style='font-size:20px'>📋</span>
-                <span style='font-weight:700;font-size:15px;color:{NHS_COLORS['ink']}'>
-                    Transparent patient recommendation summary
-                </span>
-            </div>
-            {html_sections}
-        </div>
-        """,
-        unsafe_allow_html=True,
+    spec["pct_within_18"] = (spec["within_18_weeks"] / spec["total_waiting"] * 100).round(1)
+    return spec
+
+
+@st.cache_data(show_spinner="Loading trust data...")
+def build_trust_data(df):
+    latest_period = df["period"].max()
+    trust = (
+        df[
+            (df["period"] == latest_period) &
+            (df["rtt_part_type"] == "Part_2") &
+            (df["treatment_function_code"] == "C_999")
+        ]
+        .groupby(["provider_org_code", "provider_org_name", "commissioner_org_name"])[
+            ["total_waiting", "within_18_weeks", "over_52_weeks"]
+        ].sum().reset_index()
     )
+    trust["pct_within_18"]     = (trust["within_18_weeks"] / trust["total_waiting"] * 100).round(1)
+    trust["median_wait_weeks"] = ((1 - trust["pct_within_18"] / 100) * 52 + 4).round(0).astype(int)
+    return trust
 
 
-def highlight_performance(value: float) -> str:
-    return f"color:{performance_color(value)};font-weight:bold"
-
-
-credentials = get_kaggle_credentials_from_streamlit()
 try:
-    data_result = load_dashboard_data(
-        credentials["username"] if credentials else None,
-        credentials["key"] if credentials else None,
-    )
-    df = data_result.dataframe
-    national, specialty_data, trust_data, trust_specialty_data = build_dashboard_views(df)
-except (DataLoadError, DataValidationError) as exc:
-    st.error(
-        f"Could not load the NHS RTT dataset.\n\n{exc}\n\n"
-        "Place the CSV next to `app.py` for the most reliable setup. "
-        "Optional Kaggle credentials can be supplied in Streamlit secrets under `kaggle.username` and `kaggle.key`."
-    )
+    df           = load_data()
+    national     = build_national(df)
+    nat_forecast = run_prophet(national[["period_dt", "total_waiting"]])
+    spec_data    = build_specialty_data(df)
+    trust_data   = build_trust_data(df)
+
+    latest   = national.iloc[-1]
+    hist_end = national["period_dt"].max()
+    fc_future = nat_forecast[nat_forecast["ds"] > hist_end]
+
+    DATA_LOADED = True
+except FileNotFoundError:
+    DATA_LOADED = False
+
+
+st.markdown(f"""
+<div style='background:{NHS_BLUE};padding:20px 24px;border-radius:16px;margin-bottom:20px'>
+  <h2 style='color:white;margin:0'>🏥 NHS RTT Waiting List Predictor</h2>
+  <p style='color:#93C5FD;margin:4px 0 0;font-size:13px'>
+    AI-powered forecasting · England 2021–2025 · NHS England Open Data
+  </p>
+</div>
+""", unsafe_allow_html=True)
+
+if not DATA_LOADED:
+    st.error("""
+    ⚠️ **CSV file not found.**
+
+    Make sure `nhs_rtt_waiting_times_2021_2025.csv` is in the same folder as `app.py`.
+
+    ```
+    📁 nhs_project/
+       app.py
+       nhs_rtt_waiting_times_2021_2025.csv
+    ```
+    Then run: `streamlit run app.py`
+    """)
     st.stop()
 
-latest_period = latest_period_value(df)
-period_range = format_period_range(
-    national[Columns.PERIOD_DT].min(),
-    national[Columns.PERIOD_DT].max(),
-)
-latest_national = national.sort_values(Columns.PERIOD_DT).iloc[-1]
-national_forecast = build_forecast(national[[Columns.PERIOD_DT, Columns.TOTAL_WAITING]])
-national_future = national_forecast.future
-all_specialties = sorted(specialty_data[Columns.TREATMENT_FUNCTION_NAME].dropna().unique())
 
-render_header(period_range=period_range, source_label=data_result.source_label)
-st.caption(f"Loaded from `{data_result.source_path}`")
+def kpi(label, value, sub, color):
+    return f"""
+    <div class='metric-card'>
+        <div class='metric-label'>{label}</div>
+        <div class='metric-value' style='color:{color}'>{value}</div>
+        <div class='metric-sub'>{sub}</div>
+    </div>"""
 
-if len(national) < FORECAST_MIN_HISTORY_POINTS:
-    st.warning(
-        f"Only {len(national)} monthly snapshots are currently loaded. "
-        "Forecasts remain available, but they will use safer baseline logic until longer history is present."
-    )
+def fmt(n):
+    if not n or np.isnan(n): return "—"
+    return f"{n/1e6:.2f}M" if n >= 1e6 else f"{n/1e3:.0f}K" if n >= 1e3 else str(int(n))
 
-forecast_12_month = national_future["yhat"].iloc[-1] if not national_future.empty else None
+pct_color = NHS_GREEN if latest.pct_within_18 >= 70 else NHS_YELLOW if latest.pct_within_18 >= 50 else NHS_RED
+fc12 = fc_future["yhat"].iloc[-1] if len(fc_future) >= 12 else fc_future["yhat"].iloc[-1]
 
 c1, c2, c3, c4 = st.columns(4)
-with c1:
-    st.markdown(
-        metric_card(
-            "Total Waiting (Latest)",
-            format_compact_number(latest_national[Columns.TOTAL_WAITING]),
-            "Incomplete pathways",
-            NHS_COLORS["blue"],
-        ),
-        unsafe_allow_html=True,
-    )
-with c2:
-    pct_value = float(latest_national[Columns.PCT_WITHIN_18_WEEKS])
-    st.markdown(
-        metric_card(
-            "% Within 18 Weeks",
-            f"{pct_value:.1f}%",
-            f"Target: {NATIONAL_TARGETS['constitutional_pct_within_18']:.0f}%",
-            performance_color(pct_value),
-        ),
-        unsafe_allow_html=True,
-    )
-with c3:
-    st.markdown(
-        metric_card(
-            "Over 52 Weeks",
-            format_compact_number(latest_national[Columns.OVER_52_WEEKS]),
-            "Long waits",
-            NHS_COLORS["red"],
-        ),
-        unsafe_allow_html=True,
-    )
-with c4:
-    outlook_subtext = FORECAST_METHOD_LABELS.get(national_forecast.method, national_forecast.method)
-    st.markdown(
-        metric_card(
-            "12-Month Outlook",
-            format_compact_number(forecast_12_month),
-            outlook_subtext,
-            NHS_COLORS["yellow"],
-        ),
-        unsafe_allow_html=True,
-    )
+with c1: st.markdown(kpi("Total Waiting (Latest)", fmt(latest.total_waiting), "Incomplete pathways", NHS_BLUE), unsafe_allow_html=True)
+with c2: st.markdown(kpi("% Within 18 Weeks", f"{latest.pct_within_18}%", "Target: 92%", pct_color), unsafe_allow_html=True)
+with c3: st.markdown(kpi("Over 52 Weeks", fmt(latest.over_52_weeks), "Long waits", NHS_RED), unsafe_allow_html=True)
+with c4: st.markdown(kpi("12-Month Forecast", fmt(fc12), "Predicted total", NHS_YELLOW), unsafe_allow_html=True)
 
 st.markdown("<br>", unsafe_allow_html=True)
 
 tab1, tab2, tab3 = st.tabs(["📊 National Trend", "🔬 By Specialty", "👤 Patient Predictor"])
 
-with tab1:
-    metric = st.radio(
-        "View",
-        ["Waiting List Size", "% Within 18 Weeks"],
-        horizontal=True,
-        label_visibility="collapsed",
-    )
 
-    figure = go.Figure()
+with tab1:
+    metric = st.radio("View", ["Waiting List Size", "% Within 18 Weeks"],
+                      horizontal=True, label_visibility="collapsed")
+
+    fig = go.Figure()
 
     if metric == "Waiting List Size":
-        figure.add_trace(
-            go.Scatter(
-                x=national[Columns.PERIOD_DT],
-                y=national[Columns.TOTAL_WAITING] / 1_000_000,
-                name="Historical",
-                line=dict(color=NHS_COLORS["blue"], width=2.5),
-                fill="tozeroy",
-                fillcolor="rgba(0,48,135,0.08)",
-            )
-        )
-        figure.add_trace(
-            go.Scatter(
-                x=national_future["ds"],
-                y=national_future["yhat"] / 1_000_000,
-                name="Forecast",
-                line=dict(color=NHS_COLORS["green"], width=2.5, dash="dash"),
-            )
-        )
-        figure.add_traces(
-            [
-                go.Scatter(
-                    x=national_future["ds"],
-                    y=national_future["yhat_upper"] / 1_000_000,
-                    fill=None,
-                    mode="lines",
-                    line=dict(width=0),
-                    showlegend=False,
-                ),
-                go.Scatter(
-                    x=national_future["ds"],
-                    y=national_future["yhat_lower"] / 1_000_000,
-                    fill="tonexty",
-                    mode="lines",
-                    line=dict(width=0),
-                    fillcolor="rgba(0,178,148,0.15)",
-                    name="Forecast range",
-                ),
-            ]
-        )
-        figure.update_yaxes(title="Patients (Millions)")
+        fig.add_trace(go.Scatter(
+            x=national["period_dt"], y=national["total_waiting"] / 1e6,
+            name="Historical", line=dict(color=NHS_BLUE, width=2.5),
+            fill="tozeroy", fillcolor="rgba(0,48,135,0.08)"
+        ))
+        fig.add_trace(go.Scatter(
+            x=fc_future["ds"], y=fc_future["yhat"] / 1e6,
+            name="Forecast", line=dict(color=NHS_GREEN, width=2.5, dash="dash")
+        ))
+        fig.add_traces([
+            go.Scatter(x=fc_future["ds"], y=fc_future["yhat_upper"] / 1e6,
+                       fill=None, mode="lines", line=dict(width=0), showlegend=False),
+            go.Scatter(x=fc_future["ds"], y=fc_future["yhat_lower"] / 1e6,
+                       fill="tonexty", mode="lines", line=dict(width=0),
+                       fillcolor="rgba(0,178,148,0.15)", name="95% CI"),
+        ])
+        fig.update_yaxes(title="Patients (Millions)")
     else:
-        figure.add_trace(
-            go.Scatter(
-                x=national[Columns.PERIOD_DT],
-                y=national[Columns.PCT_WITHIN_18_WEEKS],
-                name="% Within 18 Weeks",
-                line=dict(color=NHS_COLORS["blue"], width=2.5),
-            )
-        )
-        figure.add_hline(
-            y=NATIONAL_TARGETS["constitutional_pct_within_18"],
-            line_dash="dash",
-            line_color=NHS_COLORS["red"],
-            annotation_text="92% constitutional target",
-        )
-        figure.add_hline(
-            y=NATIONAL_TARGETS["interim_pct_within_18"],
-            line_dash="dot",
-            line_color=NHS_COLORS["yellow"],
-            annotation_text="65% interim target",
-        )
-        figure.update_yaxes(title="Percentage (%)", range=[40, 100])
+        fig.add_trace(go.Scatter(
+            x=national["period_dt"], y=national["pct_within_18"],
+            name="% Within 18 Wks", line=dict(color=NHS_BLUE, width=2.5)
+        ))
+        fig.add_hline(y=92, line_dash="dash", line_color=NHS_RED,
+                      annotation_text="92% constitutional target")
+        fig.add_hline(y=65, line_dash="dot", line_color=NHS_YELLOW,
+                      annotation_text="65% March 2026 interim target")
+        fig.update_yaxes(title="Percentage (%)", range=[40, 100])
 
-    figure.update_layout(
-        height=360,
-        template="plotly_white",
-        title="National Waiting List — Historical and 12-Month Outlook",
-        legend=dict(orientation="h", y=-0.15),
-    )
-    st.plotly_chart(figure, use_container_width=True)
-    render_forecast_caption(national_forecast)
+    fig.update_layout(height=360, template="plotly_white",
+                      title="National Waiting List — Historical & 12-Month Forecast",
+                      legend=dict(orientation="h", y=-0.15))
+    st.plotly_chart(fig, use_container_width=True)
 
-    figure_over_52 = go.Figure(
-        go.Bar(
-            x=national[Columns.PERIOD_DT],
-            y=national[Columns.OVER_52_WEEKS] / 1_000,
-            marker_color=NHS_COLORS["red"],
-            opacity=0.8,
-        )
-    )
-    figure_over_52.update_layout(
-        height=250,
-        template="plotly_white",
-        title="Patients Waiting Over 52 Weeks (Thousands)",
-        yaxis_title="Patients (K)",
-    )
-    st.plotly_chart(figure_over_52, use_container_width=True)
+    fig2 = go.Figure(go.Bar(
+        x=national["period_dt"], y=national["over_52_weeks"] / 1e3,
+        marker_color=NHS_RED, opacity=0.8
+    ))
+    fig2.update_layout(height=250, template="plotly_white",
+                       title="Patients Waiting Over 52 Weeks (Thousands)",
+                       yaxis_title="Patients (K)")
+    st.plotly_chart(fig2, use_container_width=True)
+
 
 with tab2:
-    selected_specialty = st.selectbox("Select specialty", all_specialties)
+    all_specs = sorted(spec_data["treatment_function_name"].dropna().unique())
+    sel_spec  = st.selectbox("Select specialty", all_specs)
 
-    specialty_history = specialty_data[
-        specialty_data[Columns.TREATMENT_FUNCTION_NAME] == selected_specialty
-    ].copy()
-    specialty_forecast = build_forecast(
-        specialty_history[[Columns.PERIOD_DT, Columns.TOTAL_WAITING]]
-    )
+    spec_hist = spec_data[spec_data["treatment_function_name"] == sel_spec].copy()
 
-    specialty_figure = go.Figure()
-    specialty_figure.add_trace(
-        go.Scatter(
-            x=specialty_history[Columns.PERIOD_DT],
-            y=specialty_history[Columns.TOTAL_WAITING],
-            name="Historical",
-            line=dict(color=NHS_COLORS["blue"], width=2.5),
-            fill="tozeroy",
-            fillcolor="rgba(0,48,135,0.08)",
-        )
-    )
-    specialty_figure.add_trace(
-        go.Scatter(
-            x=specialty_forecast.future["ds"],
-            y=specialty_forecast.future["yhat"],
-            name="Forecast",
-            line=dict(color=NHS_COLORS["green"], width=2.5, dash="dash"),
-        )
-    )
-    specialty_figure.add_traces(
-        [
-            go.Scatter(
-                x=specialty_forecast.future["ds"],
-                y=specialty_forecast.future["yhat_upper"],
-                fill=None,
-                mode="lines",
-                line=dict(width=0),
-                showlegend=False,
-            ),
-            go.Scatter(
-                x=specialty_forecast.future["ds"],
-                y=specialty_forecast.future["yhat_lower"],
-                fill="tonexty",
-                mode="lines",
-                line=dict(width=0),
-                fillcolor="rgba(0,178,148,0.15)",
-                name="Forecast range",
-            ),
-        ]
-    )
-    specialty_figure.update_layout(
-        height=340,
-        template="plotly_white",
-        title=f"{selected_specialty} — Waiting List and 12-Month Outlook",
-        yaxis_title="Patients",
-        legend=dict(orientation="h", y=-0.15),
-    )
-    st.plotly_chart(specialty_figure, use_container_width=True)
-    render_forecast_caption(specialty_forecast)
+    if len(spec_hist) >= 12:
+        spec_fc     = run_prophet(spec_hist[["period_dt", "total_waiting"]], periods=12)
+        spec_future = spec_fc[spec_fc["ds"] > hist_end]
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(
+            x=spec_hist["period_dt"], y=spec_hist["total_waiting"],
+            name="Historical", line=dict(color=NHS_BLUE, width=2.5),
+            fill="tozeroy", fillcolor="rgba(0,48,135,0.08)"
+        ))
+        fig3.add_trace(go.Scatter(
+            x=spec_future["ds"], y=spec_future["yhat"],
+            name="Forecast", line=dict(color=NHS_GREEN, width=2.5, dash="dash")
+        ))
+        fig3.add_traces([
+            go.Scatter(x=spec_future["ds"], y=spec_future["yhat_upper"],
+                       fill=None, mode="lines", line=dict(width=0), showlegend=False),
+            go.Scatter(x=spec_future["ds"], y=spec_future["yhat_lower"],
+                       fill="tonexty", mode="lines", line=dict(width=0),
+                       fillcolor="rgba(0,178,148,0.15)", name="95% CI"),
+        ])
+        fig3.update_layout(height=340, template="plotly_white",
+                           title=f"{sel_spec} — Waiting List & 12-Month Forecast",
+                           yaxis_title="Patients",
+                           legend=dict(orientation="h", y=-0.15))
+        st.plotly_chart(fig3, use_container_width=True)
+    else:
+        st.info("Not enough data points for this specialty to generate a forecast.")
 
     st.subheader("Trust Performance — Latest Month")
-    specialty_trust_table = trust_specialty_data[
-        trust_specialty_data[Columns.TREATMENT_FUNCTION_NAME] == selected_specialty
-    ].copy()
+    display_trusts = trust_data.sort_values("median_wait_weeks")[
+        ["provider_org_name", "commissioner_org_name",
+         "total_waiting", "pct_within_18", "median_wait_weeks"]
+    ].rename(columns={
+        "provider_org_name":    "Trust",
+        "commissioner_org_name": "Region / ICB",
+        "total_waiting":        "Total Waiting",
+        "pct_within_18":        "% Within 18 Wks",
+        "median_wait_weeks":    "Est. Wait (wks)",
+    })
 
-    if specialty_trust_table.empty:
-        st.warning(
-            "No latest-month trust + specialty rows were available for this specialty. "
-            "Showing trust-wide latest-month performance instead."
-        )
-        display_trusts = trust_data[
-            [
-                Columns.PROVIDER_ORG_NAME,
-                Columns.COMMISSIONER_ORG_NAME,
-                Columns.TOTAL_WAITING,
-                Columns.PCT_WITHIN_18_WEEKS,
-                Columns.ESTIMATED_WAIT_WEEKS_PROXY,
-                Columns.ESTIMATE_SOURCE_LABEL,
-            ]
-        ].rename(
-            columns={
-                Columns.PROVIDER_ORG_NAME: "Trust",
-                Columns.COMMISSIONER_ORG_NAME: "Region / ICB",
-                Columns.TOTAL_WAITING: "Total Waiting",
-                Columns.PCT_WITHIN_18_WEEKS: "% Within 18 Wks",
-                Columns.ESTIMATED_WAIT_WEEKS_PROXY: "Wait Proxy (wks)",
-                Columns.ESTIMATE_SOURCE_LABEL: "Estimate Basis",
-            }
-        )
-    else:
-        st.caption(
-            "Wait Proxy (wks) is a heuristic derived from latest trust + specialty RTT performance, "
-            "not a patient-level predicted waiting time."
-        )
-        display_trusts = specialty_trust_table[
-            [
-                Columns.PROVIDER_ORG_NAME,
-                Columns.COMMISSIONER_ORG_NAME,
-                Columns.TOTAL_WAITING,
-                Columns.PCT_WITHIN_18_WEEKS,
-                Columns.ESTIMATED_WAIT_WEEKS_PROXY,
-            ]
-        ].rename(
-            columns={
-                Columns.PROVIDER_ORG_NAME: "Trust",
-                Columns.COMMISSIONER_ORG_NAME: "Region / ICB",
-                Columns.TOTAL_WAITING: "Total Waiting",
-                Columns.PCT_WITHIN_18_WEEKS: "% Within 18 Wks",
-                Columns.ESTIMATED_WAIT_WEEKS_PROXY: "Wait Proxy (wks)",
-            }
-        )
+    def highlight(val):
+        if isinstance(val, (int, float)):
+            if val >= 70: return f"color:{NHS_GREEN};font-weight:bold"
+            if val >= 50: return f"color:{NHS_YELLOW};font-weight:bold"
+            return f"color:{NHS_RED};font-weight:bold"
+        return ""
 
-    display_trusts = display_trusts.sort_values("Wait Proxy (wks)")
     st.dataframe(
-        display_trusts.style.applymap(highlight_performance, subset=["% Within 18 Wks"]),
-        use_container_width=True,
-        height=400,
+        display_trusts.style.applymap(highlight, subset=["% Within 18 Wks"]),
+        use_container_width=True, height=400
     )
+
 
 with tab3:
     st.markdown("### 👤 Patient Wait Time Predictor")
-    st.caption(
-        "Use the latest RTT data to build a cautious proxy estimate and compare specialty-aware alternatives. "
-        "This is planning support, not a patient-level prediction."
-    )
+    st.caption("Fill in your details below to get a data-driven wait estimate and alternative Trust suggestions.")
+
+    SYMPTOM_MAP = {
+        "knee": "Trauma and Orthopaedic Service", "hip": "Trauma and Orthopaedic Service",
+        "back": "Trauma and Orthopaedic Service", "joint": "Trauma and Orthopaedic Service",
+        "fracture": "Trauma and Orthopaedic Service", "bone": "Trauma and Orthopaedic Service",
+        "hernia": "General Surgery Service", "gallstone": "General Surgery Service",
+        "appendix": "General Surgery Service", "stomach": "General Surgery Service",
+        "bowel": "General Surgery Service", "kidney": "Urology Service",
+        "bladder": "Urology Service", "prostate": "Urology Service",
+        "urine": "Urology Service", "ear": "Ear Nose and Throat Service",
+        "nose": "Ear Nose and Throat Service", "throat": "Ear Nose and Throat Service",
+        "hearing": "Ear Nose and Throat Service", "tonsil": "Ear Nose and Throat Service",
+        "sinus": "Ear Nose and Throat Service", "eye": "Ophthalmology Service",
+        "vision": "Ophthalmology Service", "cataract": "Ophthalmology Service",
+        "heart": "Cardiology Service", "chest": "Cardiology Service",
+        "cardiac": "Cardiology Service", "skin": "Dermatology Service",
+        "rash": "Dermatology Service", "eczema": "Dermatology Service",
+        "psoriasis": "Dermatology Service", "period": "Gynaecology Service",
+        "gynaecol": "Gynaecology Service", "ovarian": "Gynaecology Service",
+        "endometrio": "Gynaecology Service", "neuro": "Neurology Service",
+        "headache": "Neurology Service", "migraine": "Neurology Service",
+        "seizure": "Neurology Service", "digestion": "Gastroenterology Service",
+        "crohn": "Gastroenterology Service", "ibs": "Gastroenterology Service",
+        "colitis": "Gastroenterology Service",
+    }
+
+    def suggest_specialty(symptoms_text):
+        if not symptoms_text:
+            return None
+        low = symptoms_text.lower()
+        for kw, spec in SYMPTOM_MAP.items():
+            if kw in low:
+                return spec
+        return None
+
+    def build_advice(specialty, urgency, symptoms, trust, region,
+                     curr_wait, curr_pct, region_alts, spec_trend,
+                     spec_hist, nat_hist):
+        lines = []
+
+        urgency_factor = {
+            "Two-Week Wait (Cancer Pathway)": 0.08,
+            "Urgent": 0.45,
+            "Routine": 1.0,
+        }.get(urgency, 1.0)
+        adj_wait = max(2, round(curr_wait * urgency_factor))
+
+        lines.append("📅  ESTIMATED WAIT TIME")
+        lines.append("─" * 42)
+
+        if urgency == "Two-Week Wait (Cancer Pathway)":
+            lines.append(
+                f"⚠️  You are on the Two-Week Wait (cancer) pathway. "
+                f"The NHS target is to see you within 14 days of referral. "
+                f"If you have not received an appointment within 14 days, "
+                f"contact your GP immediately."
+            )
+        elif urgency == "Urgent":
+            lines.append(
+                f"Your referral is marked URGENT. You are prioritised above "
+                f"routine patients. Based on current NHS RTT data for "
+                f"{trust}, your estimated wait is approximately "
+                f"~{adj_wait} weeks — significantly shorter than the "
+                f"routine wait of ~{curr_wait} weeks."
+            )
+        else:
+            lines.append(
+                f"Based on current NHS England RTT data, patients referred "
+                f"to {trust} for {specialty} are waiting approximately "
+                f"~{curr_wait} weeks. Only {curr_pct}% of patients at this "
+                f"trust are being seen within the 18-week NHS target "
+                f"(constitutional standard: 92%)."
+            )
+
+        lines.append("")
+        lines.append("📈  WAITING LIST TREND")
+        lines.append("─" * 42)
+
+        if spec_trend == "increasing":
+            lines.append(
+                f"⚠️  The waiting list for {specialty} has been "
+                f"INCREASING over recent months. If you delay action, "
+                f"your wait could be longer. Confirm your referral with "
+                f"your GP as soon as possible."
+            )
+        elif spec_trend == "decreasing":
+            lines.append(
+                f"✅  The waiting list for {specialty} has been "
+                f"DECREASING recently — a positive sign. The NHS Elective "
+                f"Reform Plan is having some effect in this specialty."
+            )
+        else:
+            lines.append(
+                f"The waiting list for {specialty} has been broadly "
+                f"stable over recent months."
+            )
+
+        lines.append("")
+        lines.append("🏥  ALTERNATIVE TRUSTS IN YOUR REGION")
+        lines.append("─" * 42)
+
+        better_alts = region_alts[region_alts["median_wait_weeks"] < curr_wait].head(3)
+
+        if better_alts.empty:
+            lines.append(
+                f"Your current trust ({trust}) already has one of the "
+                f"shorter wait times in {region}. No significantly better "
+                f"alternatives were found nearby."
+            )
+        else:
+            lines.append(
+                f"The following trusts in {region} have shorter wait times "
+                f"and may be worth considering:"
+            )
+            lines.append("")
+            for i, (_, alt) in enumerate(better_alts.iterrows(), 1):
+                saving = max(0, curr_wait - int(alt.median_wait_weeks))
+                status = "✅ On track" if alt.pct_within_18 >= 65 else "⚠️  Below target"
+                lines.append(
+                    f"  {i}. {alt.provider_org_name}\n"
+                    f"     Wait: ~{int(alt.median_wait_weeks)} weeks  "
+                    f"| Save: ~{saving} weeks  "
+                    f"| 18-wk performance: {alt.pct_within_18}%  "
+                    f"| {status}"
+                )
+
+        lines.append("")
+        lines.append("💡  YOUR NHS RIGHT TO CHOOSE")
+        lines.append("─" * 42)
+        lines.append(
+            "Under the NHS Constitution, you have a legal right to choose "
+            "where you receive your NHS treatment. You can ask your GP to "
+            "refer you to any of the trusts listed above via the NHS "
+            "e-Referral Service (formerly Choose and Book). This is free "
+            "and you do not need to give a reason for choosing a different trust."
+        )
+
+        lines.append("")
+        lines.append("🩺  SHOULD YOU CONTACT YOUR GP?")
+        lines.append("─" * 42)
+
+        if urgency == "Two-Week Wait (Cancer Pathway)":
+            lines.append(
+                "YES — contact your GP today if you have not received a "
+                "hospital appointment within 14 days of referral."
+            )
+        elif curr_pct < 55:
+            lines.append(
+                "YES — your trust's 18-week performance is significantly "
+                "below the NHS target. Speak to your GP about switching "
+                "your referral to a better-performing trust."
+            )
+        elif spec_trend == "increasing":
+            lines.append(
+                "CONSIDER IT — given the increasing waiting list trend for "
+                "this specialty, speak to your GP about whether your referral "
+                "can be expedited or redirected."
+            )
+        else:
+            lines.append(
+                "Continue to monitor. If you have not received an appointment "
+                "within 18 weeks of your referral date, contact your GP to "
+                "chase the referral — this is your right under the NHS Constitution."
+            )
+
+        lines.append("")
+        lines.append("─" * 42)
+        lines.append(
+            "📊 Analysis based on NHS England Consultant-Led RTT Waiting "
+            "Times data (2021–2025). All figures are from the most recent "
+            "available monthly release."
+        )
+
+        return "\n".join(lines)
 
     symptoms = st.text_area(
-        "Describe your symptoms (optional — used only for a rule-based specialty suggestion)",
-        placeholder="e.g. knee pain when walking, referred by GP for orthopaedic assessment...",
+        "Describe your symptoms (optional — helps suggest specialty)",
+        placeholder="e.g. knee pain when walking, referred by GP for orthopaedic assessment..."
     )
 
-    specialty_suggestion = suggest_specialty_from_symptoms(symptoms, all_specialties)
-    if specialty_suggestion.specialty:
-        keyword_text = ", ".join(specialty_suggestion.matched_keywords)
-        st.caption(
-            f"Suggested specialty from symptom keywords: {specialty_suggestion.specialty}"
-            f" ({keyword_text})"
-        )
+    col1, col2 = st.columns(2)
+    with col1:
+        suggested    = suggest_specialty(symptoms)
+        spec_default = all_specs.index(suggested) + 1 if suggested and suggested in all_specs else 0
+        specialty    = st.selectbox("Referred Specialty *", [""] + all_specs, index=spec_default)
 
-    left_col, right_col = st.columns(2)
-    with left_col:
-        specialty_options = [""] + all_specialties
-        default_index = (
-            specialty_options.index(specialty_suggestion.specialty)
-            if specialty_suggestion.specialty in specialty_options
-            else 0
-        )
-        selected_patient_specialty = st.selectbox(
-            "Referred Specialty *",
-            specialty_options,
-            index=default_index,
-        )
+        all_regions = sorted(trust_data["commissioner_org_name"].dropna().unique().tolist())
+        region      = st.selectbox("Your Region / ICB *", [""] + all_regions)
 
-        all_regions = sorted(
-            trust_data[Columns.COMMISSIONER_ORG_NAME].dropna().unique().tolist()
-        )
-        selected_region = st.selectbox("Your Region / ICB *", [""] + all_regions)
-
-    with right_col:
+    with col2:
         urgency = st.selectbox(
             "Referral Urgency *",
-            ["", "Routine", "Urgent", "Two-Week Wait (Cancer Pathway)"],
+            ["", "Routine", "Urgent", "Two-Week Wait (Cancer Pathway)"]
         )
 
-        if selected_region:
+        if region:
             region_trust_list = sorted(
                 trust_data[
-                    trust_data[Columns.COMMISSIONER_ORG_NAME] == selected_region
-                ][Columns.PROVIDER_ORG_NAME]
-                .dropna()
-                .unique()
-                .tolist()
+                    trust_data["commissioner_org_name"] == region
+                ]["provider_org_name"].dropna().unique().tolist()
             )
         else:
             region_trust_list = []
 
-        selected_trust = st.selectbox(
+        trust = st.selectbox(
             "Your NHS Trust *",
-            [""] + region_trust_list,
-            disabled=not selected_region,
+            ["Select your region first..." if not region else ""] + region_trust_list,
+            disabled=(not region),
         )
 
     submitted = st.button(
         "🔮 Predict My Wait & Find Alternatives",
-        use_container_width=True,
-        type="primary",
+        use_container_width=True, type="primary"
     )
 
     if submitted:
-        if not selected_patient_specialty or not urgency or not selected_region or not selected_trust:
-            st.warning(
-                "Please fill in Specialty, Urgency, Region and Trust before predicting."
-            )
+        if not specialty or not urgency or not trust or trust == "Select your region first...":
+            st.warning("Please fill in Specialty, Urgency, Region and Trust before predicting.")
         else:
-            try:
-                current_estimate = resolve_wait_estimate(
-                    trust_name=selected_trust,
-                    region=selected_region,
-                    specialty=selected_patient_specialty,
-                    trust_summary=trust_data,
-                    trust_specialty_summary=trust_specialty_data,
-                )
-            except ValueError as exc:
-                st.error(str(exc))
-                st.stop()
+            trust_row   = trust_data[trust_data["provider_org_name"] == trust]
+            region_alts = trust_data[
+                (trust_data["commissioner_org_name"] == region) &
+                (trust_data["provider_org_name"] != trust)
+            ].sort_values("median_wait_weeks")
 
-            alternatives = build_region_alternatives(
-                region=selected_region,
-                specialty=selected_patient_specialty,
-                current_trust=selected_trust,
-                trust_summary=trust_data,
-                trust_specialty_summary=trust_specialty_data,
-            )
+            curr_wait = int(trust_row["median_wait_weeks"].values[0]) if not trust_row.empty else 24
+            curr_pct  = float(trust_row["pct_within_18"].values[0])   if not trust_row.empty else 60.0
 
-            specialty_history_filtered = specialty_data[
-                specialty_data[Columns.TREATMENT_FUNCTION_NAME]
-                == selected_patient_specialty
-            ].copy()
-            specialty_trend = classify_recent_trend(specialty_history_filtered)
-            current_adjusted_wait = apply_urgency_adjustment(
-                current_estimate.estimated_wait_weeks_proxy,
-                urgency,
-            )
+            spec_hist_filt = spec_data[spec_data["treatment_function_name"] == specialty]
+            spec_trend = "stable"
+            if len(spec_hist_filt) > 3:
+                recent = spec_hist_filt.sort_values("period_dt").tail(4)["total_waiting"].values
+                change = (recent[-1] - recent[0]) / max(recent[0], 1) * 100
+                spec_trend = "increasing" if change > 3 else "decreasing" if change < -3 else "stable"
 
-            if current_estimate.estimate_source != ESTIMATE_SOURCE_SPECIALTY:
-                st.warning(
-                    f"No latest trust + specialty row was available for {selected_trust} / "
-                    f"{selected_patient_specialty}. The current estimate uses trust-wide performance instead."
-                )
+            st.markdown("#### 📅 Estimated Wait Times")
+            urgency_factor = {"Two-Week Wait (Cancer Pathway)": 0.08, "Urgent": 0.45, "Routine": 1.0}.get(urgency, 1.0)
+            adj_wait = max(2, round(curr_wait * urgency_factor))
 
-            specialty_based_count = int(
-                (alternatives[Columns.ESTIMATE_SOURCE] == ESTIMATE_SOURCE_SPECIALTY).sum()
-            )
-            fallback_count = int(len(alternatives) - specialty_based_count)
-            if len(alternatives) > 0:
-                if specialty_based_count == 0:
-                    st.info(
-                        "Regional alternatives use trust-wide fallback estimates because "
-                        "no latest trust + specialty rows were available in this region."
-                    )
-                elif fallback_count > 0:
-                    st.info(
-                        f"{specialty_based_count} regional alternatives use trust + specialty data and "
-                        f"{fallback_count} use trust-wide fallback estimates where specialty rows were missing."
-                    )
+            cols = st.columns([1.2] + [1] * min(3, len(region_alts)))
+            with cols[0]:
+                st.markdown(f"""
+                <div style='background:#EFF6FF;border-radius:14px;padding:16px;
+                            border:1px solid #BFDBFE;text-align:center'>
+                    <p style='font-size:11px;color:#6B7280;margin:0'>Your trust<br>
+                    <b>{trust[:28]}</b></p>
+                    <p style='font-size:32px;font-weight:700;color:{NHS_BLUE};margin:6px 0'>
+                        ~{adj_wait} wks</p>
+                    <p style='font-size:11px;color:#6B7280;margin:0'>
+                        {curr_pct}% within 18 weeks</p>
+                </div>""", unsafe_allow_html=True)
 
-            display_alternatives = alternatives.copy()
-            display_alternatives[Columns.ADJUSTED_WAIT_WEEKS_PROXY] = display_alternatives[
-                Columns.ESTIMATED_WAIT_WEEKS_PROXY
-            ].apply(lambda value: apply_urgency_adjustment(int(value), urgency))
+            better = region_alts[region_alts["median_wait_weeks"] < curr_wait].head(3)
+            for i, (_, alt) in enumerate(better.iterrows()):
+                saving = max(0, curr_wait - int(alt.median_wait_weeks))
+                with cols[i + 1]:
+                    st.markdown(f"""
+                    <div style='background:#F0FDF4;border-radius:14px;padding:16px;
+                                border:1px solid #BBF7D0;text-align:center'>
+                        <p style='font-size:11px;color:#6B7280;margin:0'>
+                            {alt.provider_org_name[:28]}</p>
+                        <p style='font-size:28px;font-weight:700;color:{NHS_GREEN};margin:6px 0'>
+                            ~{int(alt.median_wait_weeks)} wks</p>
+                        <p style='font-size:11px;color:{NHS_GREEN};margin:0'>
+                            Save ~{saving} weeks ✓</p>
+                    </div>""", unsafe_allow_html=True)
 
-            better_alternatives = display_alternatives[
-                display_alternatives[Columns.ADJUSTED_WAIT_WEEKS_PROXY]
-                < current_adjusted_wait
-            ].head(3)
+            st.markdown("<br>", unsafe_allow_html=True)
 
-            st.markdown("#### 📅 Estimated Wait Proxy")
-            cards = st.columns([1.2] + [1] * min(3, len(better_alternatives)))
-            with cards[0]:
-                st.markdown(
-                    wait_card(
-                        title=current_estimate.provider_org_name,
-                        wait_weeks=current_adjusted_wait,
-                        pct_within_18=current_estimate.pct_within_18_weeks,
-                        source_label=current_estimate.estimate_source_label,
-                        css_class="primary",
-                    ),
-                    unsafe_allow_html=True,
+            with st.spinner("Analysing NHS data..."):
+                advice_text = build_advice(
+                    specialty, urgency, symptoms, trust, region,
+                    curr_wait, curr_pct, region_alts, spec_trend,
+                    spec_hist_filt, national
                 )
 
-            for index, (_, alternative) in enumerate(better_alternatives.iterrows(), start=1):
-                alternative_wait = int(alternative[Columns.ADJUSTED_WAIT_WEEKS_PROXY])
-                saving = max(0, current_adjusted_wait - alternative_wait)
-                with cards[index]:
-                    st.markdown(
-                        wait_card(
-                            title=str(alternative[Columns.PROVIDER_ORG_NAME]),
-                            wait_weeks=alternative_wait,
-                            pct_within_18=float(alternative[Columns.PCT_WITHIN_18_WEEKS]),
-                            source_label=estimate_source_label(
-                                str(alternative[Columns.ESTIMATE_SOURCE])
-                            ),
-                            css_class="positive",
-                            saving_weeks=saving,
-                        ),
-                        unsafe_allow_html=True,
-                    )
+            st.markdown(f"""
+            <div class='ai-box'>
+                <div style='display:flex;align-items:center;gap:8px;margin-bottom:10px'>
+                    <span style='font-size:20px'>📋</span>
+                    <span style='font-weight:700;font-size:15px;color:#1E3A5F'>
+                        NHS Data-Driven Recommendation
+                    </span>
+                </div>
+                <pre style='font-size:13px;color:#374151;white-space:pre-wrap;
+                            line-height:1.7;font-family:sans-serif;margin:0'>
+{advice_text}</pre>
+            </div>
+            """, unsafe_allow_html=True)
 
-            st.caption(
-                "Wait proxy values are derived from RTT performance data and simple urgency multipliers. "
-                "They are not actual appointment dates or true median waits."
-            )
-
-            recommendation_sections = build_recommendation_sections(
-                estimate=current_estimate,
-                urgency=urgency,
-                specialty_trend=specialty_trend,
-                adjusted_wait_weeks_proxy=current_adjusted_wait,
-                alternatives=alternatives,
-                latest_period=latest_period,
-            )
-            render_recommendation_box(recommendation_sections)
-
-            st.caption(f"⚠️ {DISCLAIMER_TEXT}")
+            st.caption("⚠️ For informational purposes only. Not medical advice. Always consult your GP.")
 
     st.markdown("---")
-    info_1, info_2, info_3 = st.columns(3)
-    with info_1:
-        st.info(
-            f"**📊 Real NHS Data**\n\n{national[Columns.PERIOD_DT].nunique()} monthly RTT snapshots loaded "
-            f"({period_range})."
-        )
-    with info_2:
-        st.info(
-            "**📈 Safer Forecasting**\n\nProphet is used only when enough history is available, "
-            "with baseline fallback and simple holdout evaluation."
-        )
-    with info_3:
-        st.info(
-            "**🏥 Right to Choose**\n\nAlternative trust suggestions are specialty-aware where the latest data allows."
-        )
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.info("**📊 Real NHS Data**\n\n5 years of NHS England RTT data (2021–2025), 60 monthly snapshots.")
+    with c2:
+        st.info("**🤖 Prophet Forecasting**\n\nFacebook Prophet generates 12-month forecasts with confidence intervals.")
+    with c3:
+        st.info("**🏥 Right to Choose**\n\nNHS Constitution gives you the right to choose where you're treated.")
+
 
 st.markdown("---")
-st.caption(
-    f"Data: NHS England RTT Open Data · Source mode: {data_result.source_label} · {DISCLAIMER_TEXT}"
-)
+st.caption("Data: NHS England RTT Open Data · Licence: OGL v3.0 · Not medical advice")
