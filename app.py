@@ -30,12 +30,11 @@ from src.config import (
     PATIENT_PROXY_EXPLANATION,
 )
 from src.data_loader import (
-    choose_fullest_dataset,
     DataLoadError,
     DataValidationError,
     DataLoadResult,
-    load_google_drive_dataset,
     load_rtt_data,
+    prefer_fuller_dataset,
 )
 from src.forecasting import ForecastResult, forecast_waiting_list
 from src.patient_logic import (
@@ -86,7 +85,6 @@ def load_dashboard_data(
     kaggle_key: str | None,
 ) -> DataLoadResult:
     local_result: DataLoadResult | None = None
-    drive_result: DataLoadResult | None = None
     kaggle_result: DataLoadResult | None = None
 
     try:
@@ -96,12 +94,6 @@ def load_dashboard_data(
         )
     except DataLoadError:
         local_result = None
-
-    if local_result is None or local_result.period_count < FULL_HISTORY_TARGET_MONTHS:
-        try:
-            drive_result = load_google_drive_dataset()
-        except (DataLoadError, DataValidationError):
-            drive_result = None
 
     if kaggle_username and kaggle_key:
         try:
@@ -113,10 +105,10 @@ def load_dashboard_data(
         except DataLoadError:
             kaggle_result = None
 
-    preferred = choose_fullest_dataset([local_result, drive_result, kaggle_result])
+    preferred = prefer_fuller_dataset(local_result, kaggle_result)
     if preferred is None:
         raise DataLoadError(
-            "No RTT dataset could be loaded from the local CSV, Google Drive, or optional Kaggle fallback."
+            "No RTT dataset could be loaded from the local CSV or optional Kaggle fallback."
         )
     return preferred
 
@@ -382,7 +374,7 @@ with tab1:
         title="National Waiting List — Historical and 12-Month Outlook",
         legend=dict(orientation="h", y=-0.15),
     )
-    st.plotly_chart(figure, width="stretch")
+    st.plotly_chart(figure, use_container_width=True)
     render_forecast_caption(national_forecast)
 
     figure_over_52 = go.Figure(
@@ -399,7 +391,7 @@ with tab1:
         title="Patients Waiting Over 52 Weeks (Thousands)",
         yaxis_title="Patients (K)",
     )
-    st.plotly_chart(figure_over_52, width="stretch")
+    st.plotly_chart(figure_over_52, use_container_width=True)
 
 with tab2:
     selected_specialty = st.selectbox("Select specialty", all_specialties)
@@ -458,7 +450,7 @@ with tab2:
         yaxis_title="Patients",
         legend=dict(orientation="h", y=-0.15),
     )
-    st.plotly_chart(specialty_figure, width="stretch")
+    st.plotly_chart(specialty_figure, use_container_width=True)
     render_forecast_caption(specialty_forecast)
 
     st.subheader("Trust Performance — Latest Month")
@@ -514,8 +506,8 @@ with tab2:
 
     display_trusts = display_trusts.sort_values("Wait Proxy (wks)")
     st.dataframe(
-        display_trusts.style.map(highlight_performance, subset=["% Within 18 Wks"]),
-        width="stretch",
+        display_trusts.style.applymap(highlight_performance, subset=["% Within 18 Wks"]),
+        use_container_width=True,
         height=400,
     )
 
@@ -583,7 +575,7 @@ with tab3:
 
     submitted = st.button(
         "🔮 Predict My Wait & Find Alternatives",
-        width="stretch",
+        use_container_width=True,
         type="primary",
     )
 
